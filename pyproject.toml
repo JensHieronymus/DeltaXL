@@ -31,6 +31,9 @@ dev = ["pytest"]
 [project.scripts]
 deltaxl = "deltaxl.cli:main"
 
+[project.gui-scripts]
+deltaxl-gui = "deltaxl.gui.app:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
