@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.idea/
+.vscode/
+# Raw and large data files should never be committed
+*.raw
+*.mzML
+*.mzml
