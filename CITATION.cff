@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use DeltaXL in your work, please cite the article below and this software."
+title: "DeltaXL"
+abstract: "Quantitative comparison of crosslinking mass spectrometry (XL-MS) datasets."
+type: software
+version: 0.1.0
+date-released: 2026-10-27
+license: MIT
+repository-code: "https://github.com/JensHieronymus/DeltaXL"
+authors:
+  - family-names: Hieronymus
+    given-names: Jens
+preferred-citation:
+  type: generic
+  title: "Chemical Crosslinking Mass Spectrometry of Antibodies"
+  collection-title: "Antibody Structures, Methods in Molecular Biology"
+  publisher:
+    name: "Springer"
+  status: in-press
+  authors:
+    - family-names: Hieronymus
+      given-names: Jens
+    - family-names: Højrup
+      given-names: Peter
+  year: 2026
