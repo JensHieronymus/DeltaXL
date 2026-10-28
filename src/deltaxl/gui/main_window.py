@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from PySide6.QtCore import QSortFilterProxyModel, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QSpinBox, QTableView, QTabWidget, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar,
+    QPushButton, QSpinBox, QStackedWidget, QTableView, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from deltaxl import __version__
@@ -63,6 +63,7 @@ def _make_table(model):
     view.setSelectionBehavior(QAbstractItemView.SelectRows)
     view.setEditTriggers(QAbstractItemView.NoEditTriggers)
     view.verticalHeader().setVisible(False)
+    view.horizontalHeader().setDefaultSectionSize(135)
     view.horizontalHeader().setStretchLastSection(True)
     return view, proxy
 
@@ -77,36 +78,105 @@ class MainWindow(QMainWindow):
         self._last_options = None
         self._build_ui()
         self._build_menu()
-        self.statusBar().showMessage("Ready. Choose a FASTA file and press Run.")
+        self.statusBar().showMessage("Ready...")
 
     # ---- layout -------------------------------------------------------------------------
+    # The window is a workflow: a list of steps on the left, the page of the chosen step on the
+    # right. To add a step, add its name to STEPS and add a page in _build_ui.
+    STEPS = ("1.  Input", "2.  Digestion", "3.  Crosslinker", "4.  Results")
+
     def _build_ui(self):
         central = QWidget()
         central.setObjectName("central")
         layout = QHBoxLayout(central)
         layout.setContentsMargins(10, 10, 10, 6)
 
-        left = QVBoxLayout()
-        left.addWidget(self._input_box())
-        left.addWidget(self._digest_box())
-        left.addWidget(self._species_box())
-        buttons = QHBoxLayout()
-        self.run_button = QPushButton("Run")
+        # left: list of steps, plus Run and the progress bar
+        side = QVBoxLayout()
+        side.setContentsMargins(0, 0, 0, 0)
+        header = QLabel("Workflow")
+        header.setObjectName("taskHeader")
+        side.addWidget(header)
+        self.step_list = QListWidget()
+        self.step_list.setObjectName("stepList")
+        self.step_list.addItems(self.STEPS)
+        self.step_list.setFocusPolicy(Qt.NoFocus)
+        self.step_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.step_list.setFixedHeight(len(self.STEPS) * 48 + 4)
+        side.addWidget(self.step_list)
+        side.addSpacing(8)
+        self.run_button = QPushButton("Run analysis")
         self.run_button.setObjectName("runButton")
         self.run_button.clicked.connect(self.run)
-        buttons.addWidget(self.run_button)
-        left.addLayout(buttons)
+        side.addWidget(self.run_button)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
-        left.addWidget(self.progress)
-        left.addStretch(1)
-        left_widget = QWidget()
-        left_widget.setLayout(left)
-        left_widget.setFixedWidth(330)
-        layout.addWidget(left_widget)
+        side.addWidget(self.progress)
+        side.addStretch(1)
+        side_widget = QWidget()
+        side_widget.setObjectName("taskPane")
+        side_widget.setAttribute(Qt.WA_StyledBackground, True)
+        side_widget.setLayout(side)
+        side_widget.setFixedWidth(200)
+        layout.addWidget(side_widget)
 
+        # right: one page per step
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._page(
+            0, "Input", "Choose the protein sequences to digest.", self._input_box()))
+        self.pages.addWidget(self._page(
+            1, "Digestion", "Set how trypsin cuts the proteins in silico.", self._digest_box()))
+        self.pages.addWidget(self._page(
+            2, "Crosslinker", "Choose which DSBU species to generate. Then press Run analysis.",
+            self._species_box()))
+        self.pages.addWidget(self._results_page())
+        layout.addWidget(self.pages, 1)
+
+        self.step_list.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.step_list.setCurrentRow(0)
+        self.setCentralWidget(central)
+
+    def _page(self, index, title, hint, content):
+        """A settings page: title, short hint, the settings, and Back / Next buttons."""
+        page = QWidget()
+        col = QVBoxLayout(page)
+        col.setContentsMargins(16, 8, 8, 8)
+        heading = QLabel(title)
+        heading.setObjectName("pageTitle")
+        note = QLabel(hint)
+        note.setObjectName("pageHint")
+        note.setWordWrap(True)
+        
+        col.addWidget(heading)
+        col.addWidget(note)
+        col.addSpacing(6)
+        col.addWidget(content)
+        col.addStretch(1)
+        nav = QHBoxLayout()
+        nav.addStretch(1)
+        if index > 0:
+            back = QPushButton("Back")
+            back.clicked.connect(lambda: self.step_list.setCurrentRow(index - 1))
+            nav.addWidget(back)
+        nxt = QPushButton("Next")
+        nxt.clicked.connect(lambda: self.step_list.setCurrentRow(index + 1))
+        nav.addWidget(nxt)
+        col.addLayout(nav)
+        return page
+
+    def _results_page(self):
+        page = QWidget()
+        col = QVBoxLayout(page)
+        col.setContentsMargins(16, 8, 8, 8)
+        heading = QLabel("Results")
+        heading.setObjectName("pageTitle")
+        self.summary = QLabel("Press Run analysis to see results here.")
+        self.summary.setObjectName("pageHint")
+        
+        col.addWidget(heading)
+        col.addWidget(self.summary)
         self.peptide_model = TableModel(PEPTIDE_COLUMNS)
         self.species_model = TableModel(SPECIES_COLUMNS)
         peptide_view, _ = _make_table(self.peptide_model)
@@ -114,11 +184,17 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(peptide_view, "Peptides")
         self.tabs.addTab(species_view, "Crosslinked species")
-        layout.addWidget(self.tabs, 1)
-        self.setCentralWidget(central)
+        col.addWidget(self.tabs, 1)
+        nav = QHBoxLayout()
+        nav.addStretch(1)
+        back = QPushButton("Back to settings")
+        back.clicked.connect(lambda: self.step_list.setCurrentRow(2))
+        nav.addWidget(back)
+        col.addLayout(nav)
+        return page
 
     def _input_box(self):
-        box = QGroupBox("Input")
+        box = QGroupBox("Protein Sequence(s)")
         row = QHBoxLayout(box)
         self.fasta_edit = QLineEdit()
         self.fasta_edit.setPlaceholderText("FASTA file")
@@ -140,6 +216,8 @@ class MainWindow(QMainWindow):
         self.max_len = QSpinBox()
         self.max_len.setRange(0, 500)
         self.max_len.setSpecialValueText("no limit")
+        for spin in (self.missed, self.min_len, self.max_len):
+            spin.setMaximumWidth(110)
         self.carbamidomethyl = QCheckBox("Carbamidomethyl cysteine (+57.021)")
         self.carbamidomethyl.setChecked(True)
         form.addRow("Missed cleavages", self.missed)
@@ -170,6 +248,8 @@ class MainWindow(QMainWindow):
         self.ppm_spin.setRange(0.1, 1000)
         self.ppm_spin.setValue(10.0)
         self.ppm_spin.setSuffix(" ppm")
+        self.mass_spin.setMaximumWidth(160)
+        self.ppm_spin.setMaximumWidth(160)
         form.addRow("Neutral mass", self.mass_spin)
         form.addRow("Tolerance", self.ppm_spin)
         col.addLayout(form)
@@ -213,6 +293,7 @@ class MainWindow(QMainWindow):
     def run(self):
         path = self.fasta_edit.text().strip()
         if not path:
+            self.step_list.setCurrentRow(0)
             QMessageBox.information(self, "DeltaXL", "Choose a FASTA file first.")
             return
         self._last_options = self._options()
@@ -239,6 +320,8 @@ class MainWindow(QMainWindow):
         if shown < result.species_total:
             message += f" (showing the first {shown}; the CSV export contains all)"
         self.statusBar().showMessage(message)
+        self.summary.setText(message)
+        self.step_list.setCurrentRow(3)  # show the results
 
     def _on_failed(self, message):
         self._finish_run()
