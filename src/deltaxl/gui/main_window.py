@@ -75,6 +75,7 @@ def _make_table(model):
     view.setSelectionBehavior(QAbstractItemView.SelectRows)
     view.setEditTriggers(QAbstractItemView.NoEditTriggers)
     view.verticalHeader().setVisible(False)
+    view.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
     view.horizontalHeader().setDefaultSectionSize(135)
     view.horizontalHeader().setStretchLastSection(True)
     return view, proxy
@@ -203,6 +204,7 @@ class AssignmentTable(QTableWidget):
         super().__init__(0, 3)
         self.setHorizontalHeaderLabels(["Protein assignment", "Sequence header", "Copies"])
         self.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.extra_names = []   # names added with the button
         # the table never scrolls itself: it is as tall as its rows, and the page scrolls instead
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -295,9 +297,18 @@ class ModificationList(QWidget):
 
     def __init__(self, suggestions=()):
         super().__init__()
+        # text a little bigger than the rest of the window
+        self.setObjectName("modList")
+        size = QApplication.font().pointSizeF()
+        if size > 0:
+            self.setStyleSheet(
+                f"#modList QTableWidget, #modList QHeaderView, #modList QListWidget, "
+                f"#modList QLineEdit, #modList QDoubleSpinBox, #modList QPushButton, "
+                f"#modList QLabel {{ font-size: {size + 1:g}pt; }}")
         self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Residue", "New symbol", "Mass change (Da)"])
+        self.table.setHorizontalHeaderLabels(["Residue", "Modification Notation", "Total Mass (Da)"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -306,12 +317,14 @@ class ModificationList(QWidget):
         self.residue = QLineEdit()
         self.residue.setPlaceholderText("M")
         self.residue.setMaxLength(1)
+        self.residue.setMaximumWidth(50)
         self.symbol = QLineEdit()
         self.symbol.setPlaceholderText("Mox")
         self.mass = QDoubleSpinBox()
         self.mass.setRange(-1000, 1000)
         self.mass.setDecimals(4)
-        self.mass.setSuffix(" Da")
+        self.symbol.setMaximumWidth(90)          # room for a short notation like Mox, no more
+        self.mass.setMaximumWidth(100)
         add = QPushButton("Add")
         add.clicked.connect(self.add)
         remove = QPushButton("Remove selected")
@@ -329,14 +342,19 @@ class ModificationList(QWidget):
 
         grid = QGridLayout(self)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.addWidget(self.table, 0, 0, 1, 4)
-        grid.addWidget(self.residue, 1, 0)
-        grid.addWidget(self.symbol, 1, 1)
-        grid.addWidget(self.mass, 1, 2)
-        grid.addWidget(add, 1, 3)
-        grid.addWidget(remove, 2, 3)
-        grid.addWidget(QLabel("Suggestions (double-click to add or remove)"), 3, 0, 1, 4)
-        grid.addWidget(self.suggestions, 4, 0, 1, 4)
+        grid.addWidget(self.table, 0, 0, 1, 5)
+        # one row: the fields on the left (the Da label sits right of the mass box), the buttons right
+        fields = QHBoxLayout()
+        fields.addWidget(self.residue)
+        fields.addWidget(self.symbol)
+        fields.addWidget(self.mass)
+        fields.addWidget(QLabel("Da"))
+        fields.addStretch(1)
+        fields.addWidget(add)
+        fields.addWidget(remove)
+        grid.addLayout(fields, 1, 0, 1, 5)
+        grid.addWidget(QLabel("Suggestions (double-click to add or remove)"), 2, 0, 1, 5)
+        grid.addWidget(self.suggestions, 3, 0, 1, 5)
 
     def add(self):
         residue = self.residue.text().strip().upper()
@@ -481,7 +499,7 @@ class MainWindow(QMainWindow):
     # The window is a workflow: a list of steps on the left, the page of the chosen step on the
     # right. To add a step, add its name to STEPS and add a page in _build_ui.
     STEPS = ("1.  Protein Input",
-             "2.  Modifications and Digestion",
+             "2.  Digestion and Modifications",
              "3.  Crosslinker",
              "4.  Results")
 
@@ -528,7 +546,7 @@ class MainWindow(QMainWindow):
             0, "Protein Input", "Choose the protein sequences to digest.", self._input_box(),
             grow=True))
         self.pages.addWidget(self._page(
-            1, "Modifications and Digestion",
+            1, "Digestion and Modifications",
             "Set the modifications and how the enzyme cuts the proteins in silico.", self._digest_box()))
         self.pages.addWidget(self._page(
             2, "Crosslinker", "Choose which DSBU species to generate. Then press Run analysis.",
@@ -711,20 +729,14 @@ class MainWindow(QMainWindow):
         box = QGroupBox("Digestion Enzyme")
         row = QHBoxLayout(box)
 
-        # left, fixed: settings that apply to the peptides whatever the enzyme
+        # left, fixed: settings that apply to the peptides whatever the enzyme. Each limit can be
+        # given in amino acids (AA) or in Da, and each has a check box that turns it on or off
         general = QVBoxLayout()
-        form = QFormLayout()
-        self.min_len = QSpinBox()
-        self.min_len.setRange(1, 100)
-        self.min_len.setValue(4)
-        self.max_len = QSpinBox()
-        self.max_len.setRange(0, 500)
-        self.max_len.setSpecialValueText("no limit")
-        for spin in (self.min_len, self.max_len):
-            spin.setMaximumWidth(110)
-        form.addRow("Shortest peptide", self.min_len)
-        form.addRow("Longest peptide", self.max_len)
-        general.addLayout(form)
+        (self.min_aa_check, self.min_len,
+         self.min_da_check, self.min_da) = self._limit_rows(general, "Min. Peptide", 4, True, 600, False)
+        general.addSpacing(8)
+        (self.max_aa_check, self.max_len,
+         self.max_da_check, self.max_da) = self._limit_rows(general, "Max. Peptide", 40, False, 6000, False)
 
         # only shown once there are two or more enzymes
         self.combine_box = QWidget()
@@ -744,28 +756,34 @@ class MainWindow(QMainWindow):
         general.addWidget(self.combine_box)
         general.addStretch(1)
         row.addLayout(general)
+        row.addSpacing(24)   # room between the limits and the enzymes
 
         # right: one panel per enzyme, side by side; the row scrolls sideways when it gets wide
         self.enzyme_panels = []
         container = QWidget()
+        container.setObjectName("enzymeRow")
         self.enzyme_row = QHBoxLayout(container)
         self.enzyme_row.setContentsMargins(0, 0, 0, 0)
+        self.enzyme_row.setSpacing(20)
         self.add_enzyme_button = QPushButton("+ Add enzyme")
         self.add_enzyme_button.clicked.connect(self.add_enzyme)
-        self.enzyme_row.addWidget(self.add_enzyme_button, 0, Qt.AlignTop)
+        self.enzyme_row.addWidget(self.add_enzyme_button, 0, Qt.AlignBottom)
         self.enzyme_row.addStretch(1)
         self.enzyme_scroll = QScrollArea()
         self.enzyme_scroll.setWidgetResizable(True)
         self.enzyme_scroll.setFrameShape(QFrame.NoFrame)
         self.enzyme_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.enzyme_scroll.setObjectName("enzymeScroll")
+        # no background of its own, so the enzymes sit on the colour of the Digestion Enzyme box
+        self.enzyme_scroll.setStyleSheet(
+            "#enzymeScroll, #enzymeScroll > QWidget, #enzymeRow { background: transparent; }")
         self.enzyme_scroll.setWidget(container)
         row.addWidget(self.enzyme_scroll, 1)
 
         self.add_enzyme(DEFAULT_ENZYME)
-        # tall enough for a panel plus the sideways scroll bar
-        self.enzyme_scroll.setFixedHeight(
-            self.enzyme_panels[0].sizeHint().height()
-            + self.enzyme_scroll.horizontalScrollBar().sizeHint().height() + 6)
+        # as tall as a panel, plus room for the sideways scroll bar only while it is showing
+        self.enzyme_scroll.horizontalScrollBar().rangeChanged.connect(self._fit_enzyme_height)
+        self._fit_enzyme_height()
         col.addWidget(box)
 
         # fixed and variable modifications side by side; each applies to all sequences and residues
@@ -841,6 +859,48 @@ class MainWindow(QMainWindow):
             for protein in read_fasta(path):
                 self.add_protein_box(protein, Path(path).name)
 
+    def _limit_rows(self, parent, title, aa_value, aa_on, da_value, da_on):
+        """A title and, under it: [x] amino acids  or  [x] Da. Returns the four widgets."""
+        label = QLabel(title)
+        font = label.font()
+        font.setBold(True)
+        label.setFont(font)
+        aa_check, aa_spin = QCheckBox(), QSpinBox()
+        aa_spin.setRange(1, 500)
+        aa_spin.setValue(aa_value)
+        aa_spin.setSuffix(" AA")
+        da_check, da_spin = QCheckBox(), QDoubleSpinBox()
+        da_spin.setRange(0, 100000)
+        da_spin.setDecimals(1)
+        da_spin.setValue(da_value)
+        da_spin.setSuffix(" Da")
+        for check, spin, on in ((aa_check, aa_spin, aa_on), (da_check, da_spin, da_on)):
+            spin.setMaximumWidth(110)
+            check.toggled.connect(spin.setEnabled)   # the box switches its limit on or off
+            check.setChecked(on)
+            spin.setEnabled(on)
+        line = QHBoxLayout()
+        line.addWidget(aa_check)
+        line.addWidget(aa_spin)
+        line.addSpacing(6)
+        line.addWidget(QLabel("or"))
+        line.addSpacing(6)
+        line.addWidget(da_check)
+        line.addWidget(da_spin)
+        line.addStretch(1)
+        parent.addWidget(label)
+        parent.addLayout(line)
+        return aa_check, aa_spin, da_check, da_spin
+
+    def peptide_limits(self):
+        """The limits that are switched on; a limit that is off is None."""
+        def value(check, spin):
+            return spin.value() if check.isChecked() else None
+        return {"min_aa": value(self.min_aa_check, self.min_len),
+                "max_aa": value(self.max_aa_check, self.max_len),
+                "min_da": value(self.min_da_check, self.min_da),
+                "max_da": value(self.max_da_check, self.max_da)}
+
     def add_enzyme(self, enzyme=None):
         """Add an enzyme panel at the right end of the row (the next preset not used yet)."""
         if not isinstance(enzyme, type(DEFAULT_ENZYME)):
@@ -852,6 +912,11 @@ class MainWindow(QMainWindow):
         self.enzyme_row.insertWidget(len(self.enzyme_panels) - 1, panel, 0, Qt.AlignTop)
         self._enzymes_changed()
         self.enzyme_scroll.ensureWidgetVisible(self.add_enzyme_button)
+
+    def _fit_enzyme_height(self, *_):
+        bar = self.enzyme_scroll.horizontalScrollBar()
+        room = bar.sizeHint().height() if bar.maximum() > 0 else 0
+        self.enzyme_scroll.setFixedHeight(self.enzyme_panels[0].sizeHint().height() + room)
 
     def remove_enzyme(self, panel):
         self.enzyme_panels.remove(panel)
@@ -877,8 +942,8 @@ class MainWindow(QMainWindow):
         kinds = tuple(k for k, c in self.kind_checks.items() if c.isChecked())
         return Options(
             missed_cleavages=self.enzyme_panels[0].missed.value(),
-            min_length=self.min_len.value(),
-            max_length=self.max_len.value() or None,
+            min_length=self.min_len.value() if self.min_aa_check.isChecked() else 1,
+            max_length=self.max_len.value() if self.max_aa_check.isChecked() else None,
             carbamidomethyl=self._has_carbamidomethyl(),
             kinds=kinds,
             mass=self.mass_spin.value() if self.mass_check.isChecked() else None,
