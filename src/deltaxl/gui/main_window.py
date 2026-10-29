@@ -1,7 +1,7 @@
 """The main window. It only collects settings and shows results; the work is done in deltaxl.theory."""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 from PySide6.QtCore import QSortFilterProxyModel, Qt, QThread, QTimer, Signal
@@ -15,11 +15,12 @@ from PySide6.QtWidgets import (
 
 from deltaxl import __version__
 from deltaxl.gui.models import TableModel
-from deltaxl.gui.enzymes import DEFAULT_ENZYME, ENZYMES
+from deltaxl.gui.enzymes import CUT_HELP, DEFAULT_ENZYME, ENZYMES, UNLESS_HELP, Enzyme
 from deltaxl.gui.modifications import (
     CARBAMIDOMETHYL, DEFAULT_FIXED, SUGGESTIONS,
 )
 from deltaxl.io.fasta import read_fasta
+from deltaxl.theory.cleavage import RuleError, parse_cut, parse_unless
 from deltaxl.io.writers import (
     PEPTIDE_COLUMNS, SPECIES_COLUMNS, peptide_row, species_row,
     write_peptides_csv, write_species_csv,
@@ -411,75 +412,171 @@ class ModificationList(QWidget):
                  float(self.table.item(r, 2).text())) for r in range(self.table.rowCount())]
 
 
+class HelpMark(QLabel):
+    """A small circle with a ? in it; hovering it shows the help text."""
+
+    def __init__(self, text):
+        super().__init__("?")
+        self.setFixedSize(16, 16)
+        self.setAlignment(Qt.AlignCenter)
+        self.setToolTip(text)
+        self.setCursor(Qt.WhatsThisCursor)
+        self.setStyleSheet(
+            "QLabel { border: 1px solid palette(mid); border-radius: 8px; color: palette(mid);"
+            " font-size: 8pt; font-weight: bold; }")
+
+
+def titled(text, help_text=None):
+    """A field title, with a ? after it when there is help to show. Returns a layout."""
+    line = QHBoxLayout()
+    line.setSpacing(6)
+    line.addWidget(QLabel(text))
+    if help_text:
+        line.addWidget(HelpMark(help_text))
+    line.addStretch(1)
+    return line
+
+
+CUSTOM_ENTRY = "Custom\u2026"
+
+LIMIT_HELP = ("The {} peptide to keep. Give it in amino acids (AA), in mass (Da), or both.<br>"
+              "Tick the box of each limit you want to use; a limit that is not ticked is ignored.")
+
+
 class EnzymePanel(QGroupBox):
-    """One enzyme: a preset (or Custom), its cleavage rule and its missed cleavages."""
+    """One enzyme: its name (a preset, or one you name yourself), where it cuts, where it must
+    not cut, and its missed cleavages. The list of enzymes is shared by all panels."""
 
     removed = Signal(object)   # tells the window "remove me"
+    created = Signal(object)   # a new enzyme was named here; the other panels list it too
 
-    def __init__(self, enzyme=DEFAULT_ENZYME):
+    def __init__(self, enzymes, enzyme=DEFAULT_ENZYME):
         super().__init__()
-        self.setFixedWidth(250)
+        self.enzymes = enzymes   # the shared list of Enzyme
+        self.name = enzyme.name
+        self.setMinimumWidth(360)
+        self.setMaximumWidth(360)
+
         self.enzyme_combo = QComboBox()
-        self.enzyme_combo.addItems([e.name for e in ENZYMES] + ["Custom"])
-        self.cut_side = QComboBox()
-        self.cut_side.addItems(["after", "before"])
-        self.cut_residues = QLineEdit()
-        self.cut_residues.setPlaceholderText("KR")
-        self.cut_exceptions = QLineEdit()
-        self.cut_exceptions.setPlaceholderText("none")
-        self.exception_label = QLabel()
+        self.cut_edit = QLineEdit()
+        self.cut_edit.setPlaceholderText("(KR)/")
+        self.unless_edit = QLineEdit()
+        self.unless_edit.setPlaceholderText("(KR)P")
         self.missed = QSpinBox()
         self.missed.setRange(0, 6)
         self.missed.setValue(2)
+        self.missed.setMaximumWidth(90)
         self.remove_button = QPushButton("Remove")
         self.remove_button.clicked.connect(lambda: self.removed.emit(self))
 
+        # the enzyme alone on the first row, the rest in a grid under it
         grid = QGridLayout(self)
+        grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
-        grid.addWidget(QLabel("Enzyme"), 0, 0)
-        grid.addWidget(self.enzyme_combo, 0, 1)
-        grid.addWidget(QLabel("Cuts"), 1, 0)
-        grid.addWidget(self.cut_side, 1, 1)
-        grid.addWidget(QLabel("these residues"), 2, 0)
-        grid.addWidget(self.cut_residues, 2, 1)
-        grid.addWidget(self.exception_label, 3, 0)
-        grid.addWidget(self.cut_exceptions, 3, 1)
-        grid.addWidget(QLabel("Missed cleavages"), 4, 0)
-        grid.addWidget(self.missed, 4, 1)
-        grid.addWidget(self.remove_button, 5, 0, 1, 2)
+        grid.addLayout(titled("Enzyme", "Pick a preset, or choose Custom to name your own enzyme."), 0, 0, 1, 2)
+        grid.addWidget(self.enzyme_combo, 1, 0, 1, 2)
+        grid.addLayout(titled("Cut", CUT_HELP), 2, 0)
+        grid.addLayout(titled("Unless", UNLESS_HELP), 2, 1)
+        grid.addWidget(self.cut_edit, 3, 0)
+        grid.addWidget(self.unless_edit, 3, 1)
+        grid.addLayout(titled("Missed cleavages", "How many cut sites a peptide may contain without having been cut."), 4, 0, 1, 2)
+        grid.addWidget(self.missed, 5, 0)
+        grid.addWidget(self.remove_button, 5, 1)
 
-        # a preset fills in the rule; changing the rule by hand switches the enzyme to "Custom"
-        self.enzyme_combo.activated.connect(self._pick_enzyme)
-        self.cut_side.activated.connect(self._rule_edited)
-        self.cut_residues.textEdited.connect(self._rule_edited)
-        self.cut_exceptions.textEdited.connect(self._rule_edited)
+        self.reload()
+        self.enzyme_combo.activated.connect(self._picked)
+        self.cut_edit.textEdited.connect(self._rule_edited)
+        self.unless_edit.textEdited.connect(self._rule_edited)
         self.show_enzyme(enzyme)
 
-    def show_enzyme(self, enzyme):
-        self.enzyme_combo.setCurrentText(enzyme.name)
-        self.cut_side.setCurrentText(enzyme.side)
-        self.cut_residues.setText(enzyme.residues)
-        self.cut_exceptions.setText(enzyme.exceptions)
-        self._update_exception_label()
+    def reload(self):
+        """Fill the dropdown from the shared list, keeping the enzyme that is shown."""
+        self.enzyme_combo.clear()
+        for enzyme in self.enzymes:
+            self.enzyme_combo.addItem(enzyme.name, enzyme.name)
+        self.enzyme_combo.addItem(CUSTOM_ENTRY, None)
+        index = self.enzyme_combo.findData(self.name)
+        self.enzyme_combo.setCurrentIndex(max(index, 0))
+        self._mark_edited()
 
-    def _pick_enzyme(self):
-        for enzyme in ENZYMES:
-            if enzyme.name == self.enzyme_combo.currentText():
-                self.show_enzyme(enzyme)
+    def show_enzyme(self, enzyme):
+        self.name = enzyme.name
+        self.enzyme_combo.setCurrentIndex(max(self.enzyme_combo.findData(enzyme.name), 0))
+        self.cut_edit.setText(enzyme.cut)
+        self.unless_edit.setText(enzyme.unless)
+        self._check_rule()
+        self._mark_edited()
+
+    def _picked(self, index):
+        if self.enzyme_combo.itemData(index) is None:   # "Custom..."
+            self._new_enzyme()
+        else:
+            self.show_enzyme(self.enzymes[index])
+
+    def _new_enzyme(self):
+        name, ok = QInputDialog.getText(self, "DeltaXL", "Name the new enzyme:")
+        name = name.strip()
+        taken = {e.name.lower() for e in self.enzymes}
+        if ok and name.lower() in taken:
+            QMessageBox.information(self, "DeltaXL", f"There is already an enzyme called {name}.")
+            ok = False
+        if not ok or not name:
+            self.reload()                                # back to the enzyme that was shown
+            return
+        # the new enzyme starts from the two lines that are shown
+        enzyme = Enzyme(name, self.cut_edit.text().strip(), self.unless_edit.text().strip(), custom=True)
+        self.enzymes.append(enzyme)
+        self.created.emit(enzyme)                        # every panel lists it
+        self.show_enzyme(enzyme)
+        self.cut_edit.setFocus()
+        self.cut_edit.selectAll()
 
     def _rule_edited(self):
-        self.enzyme_combo.setCurrentText("Custom")
-        self._update_exception_label()
+        if self._check_rule():
+            for i, enzyme in enumerate(self.enzymes):
+                if enzyme.name == self.name and enzyme.custom:   # your own enzyme keeps its new lines
+                    self.enzymes[i] = replace(enzyme, cut=self.cut_edit.text().strip(),
+                                              unless=self.unless_edit.text().strip())
+        self._mark_edited()
 
-    def _update_exception_label(self):
-        self.exception_label.setText(
-            "unless next is" if self.cut_side.currentText() == "after" else "unless previous is")
+    def _check_rule(self):
+        """Red border and the reason as a tooltip on a line that cannot be read."""
+        ok = True
+        for edit, parse in ((self.cut_edit, parse_cut), (self.unless_edit, parse_unless)):
+            try:
+                parse(edit.text())
+            except RuleError as error:
+                edit.setStyleSheet("QLineEdit { border: 1px solid #d9534f; }")
+                edit.setToolTip(str(error))
+                ok = False
+            else:
+                edit.setStyleSheet("")
+                edit.setToolTip("")
+        return ok
+
+    def _mark_edited(self):
+        """A preset whose lines were changed by hand shows "(edited)" after its name."""
+        index = self.enzyme_combo.findData(self.name)
+        if index < 0:
+            return
+        enzyme = self.enzymes[index]
+        edited = not enzyme.custom and (self.cut_edit.text().strip() != enzyme.cut
+                                        or self.unless_edit.text().strip() != enzyme.unless)
+        self.enzyme_combo.setItemText(index, f"{enzyme.name} (edited)" if edited else enzyme.name)
 
     def rule(self):
-        """Returns (name, side, residues, exceptions, missed cleavages)"""
-        return (self.enzyme_combo.currentText(), self.cut_side.currentText(),
-                self.cut_residues.text().strip().upper(), self.cut_exceptions.text().strip().upper(),
+        """Returns (name, cut, unless, missed cleavages)"""
+        return (self.name, self.cut_edit.text().strip(), self.unless_edit.text().strip(),
                 self.missed.value())
+
+    def error(self):
+        """Why a line cannot be read, or an empty text if both can."""
+        for parse, edit in ((parse_cut, self.cut_edit), (parse_unless, self.unless_edit)):
+            try:
+                parse(edit.text())
+            except RuleError as error:
+                return str(error)
+        return ""
 
 
 class MainWindow(QMainWindow):
@@ -733,16 +830,21 @@ class MainWindow(QMainWindow):
         # given in amino acids (AA) or in Da, and each has a check box that turns it on or off
         general = QVBoxLayout()
         (self.min_aa_check, self.min_len,
-         self.min_da_check, self.min_da) = self._limit_rows(general, "Min. Peptide", 4, True, 600, False)
+         self.min_da_check, self.min_da) = self._limit_rows(
+             general, "Min. Peptide", LIMIT_HELP.format("shortest"), 4, True, 600, False)
         general.addSpacing(8)
         (self.max_aa_check, self.max_len,
-         self.max_da_check, self.max_da) = self._limit_rows(general, "Max. Peptide", 40, False, 6000, False)
+         self.max_da_check, self.max_da) = self._limit_rows(
+             general, "Max. Peptide", LIMIT_HELP.format("longest"), 40, False, 6000, False)
 
         # only shown once there are two or more enzymes
         self.combine_box = QWidget()
         combine_col = QVBoxLayout(self.combine_box)
         combine_col.setContentsMargins(0, 8, 0, 0)
-        combine_col.addWidget(QLabel("Apply the enzymes"))
+        combine_col.addLayout(titled(
+            "Apply the enzymes",
+            "<b>In parallel</b>: each enzyme digests the protein on its own, and all peptides are pooled.<br>"
+            "<b>In series</b>: each enzyme digests the peptides left by the one before it, in the order shown."))
         self.parallel_radio = QRadioButton("in parallel")
         self.parallel_radio.setToolTip("Each enzyme digests the protein on its own; the peptides are pooled.")
         self.serial_radio = QRadioButton("in series")
@@ -759,6 +861,7 @@ class MainWindow(QMainWindow):
         row.addSpacing(24)   # room between the limits and the enzymes
 
         # right: one panel per enzyme, side by side; the row scrolls sideways when it gets wide
+        self.enzyme_list = list(ENZYMES)   # shared by all panels; enzymes you name are added to it
         self.enzyme_panels = []
         container = QWidget()
         container.setObjectName("enzymeRow")
@@ -859,12 +962,17 @@ class MainWindow(QMainWindow):
             for protein in read_fasta(path):
                 self.add_protein_box(protein, Path(path).name)
 
-    def _limit_rows(self, parent, title, aa_value, aa_on, da_value, da_on):
+    def _limit_rows(self, parent, title, help_text, aa_value, aa_on, da_value, da_on):
         """A title and, under it: [x] amino acids  or  [x] Da. Returns the four widgets."""
         label = QLabel(title)
         font = label.font()
         font.setBold(True)
         label.setFont(font)
+        heading = QHBoxLayout()
+        heading.setSpacing(6)
+        heading.addWidget(label)
+        heading.addWidget(HelpMark(help_text))
+        heading.addStretch(1)
         aa_check, aa_spin = QCheckBox(), QSpinBox()
         aa_spin.setRange(1, 500)
         aa_spin.setValue(aa_value)
@@ -888,7 +996,7 @@ class MainWindow(QMainWindow):
         line.addWidget(da_check)
         line.addWidget(da_spin)
         line.addStretch(1)
-        parent.addWidget(label)
+        parent.addLayout(heading)
         parent.addLayout(line)
         return aa_check, aa_spin, da_check, da_spin
 
@@ -904,10 +1012,11 @@ class MainWindow(QMainWindow):
     def add_enzyme(self, enzyme=None):
         """Add an enzyme panel at the right end of the row (the next preset not used yet)."""
         if not isinstance(enzyme, type(DEFAULT_ENZYME)):
-            used = {panel.enzyme_combo.currentText() for panel in self.enzyme_panels}
-            enzyme = next((e for e in ENZYMES if e.name not in used), DEFAULT_ENZYME)
-        panel = EnzymePanel(enzyme)
+            used = {panel.name for panel in self.enzyme_panels}
+            enzyme = next((e for e in self.enzyme_list if e.name not in used), DEFAULT_ENZYME)
+        panel = EnzymePanel(self.enzyme_list, enzyme)
         panel.removed.connect(self.remove_enzyme)
+        panel.created.connect(self._enzyme_created)
         self.enzyme_panels.append(panel)
         self.enzyme_row.insertWidget(len(self.enzyme_panels) - 1, panel, 0, Qt.AlignTop)
         self._enzymes_changed()
@@ -918,6 +1027,10 @@ class MainWindow(QMainWindow):
         room = bar.sizeHint().height() if bar.maximum() > 0 else 0
         self.enzyme_scroll.setFixedHeight(self.enzyme_panels[0].sizeHint().height() + room)
 
+    def _enzyme_created(self, enzyme):
+        for panel in self.enzyme_panels:
+            panel.reload()
+
     def remove_enzyme(self, panel):
         self.enzyme_panels.remove(panel)
         panel.deleteLater()
@@ -927,8 +1040,10 @@ class MainWindow(QMainWindow):
         several = len(self.enzyme_panels) > 1
         self.combine_box.setVisible(several)          # in parallel / in series: only with 2+ enzymes
         for number, panel in enumerate(self.enzyme_panels, start=1):
-            panel.setTitle(f"Enzyme {number}" if several else "Enzyme")
+            panel.setTitle(f"Enzyme {number}" if several else "")
             panel.remove_button.setEnabled(several)   # the last enzyme cannot be removed
+        self._fit_enzyme_height()
+        QTimer.singleShot(0, self._fit_enzyme_height)  # the titles change the height of a panel
 
     def enzyme_mode(self):
         return "serial" if self.serial_radio.isChecked() else "parallel"
